@@ -1,0 +1,7 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Administración · ProEshop</title><link rel="stylesheet" href="/static/styles.css"></head><body>
+<header class="top"><a class="brand" href="/"><span class="mark">P</span><span>PROESHOP<small>GLOBAL TRACKING</small></span></a><a class="admin-link" href="/">Volver</a></header>
+<main class="admin-shell"><div class="eyebrow">ÁREA RESTRINGIDA</div><h1>Administración</h1><p class="lead">Acceso exclusivo al equipo logístico.</p>
+<form class="panel login" method="post" action="/admin/login"><label>USUARIO</label><input name="username" autocomplete="username" required>
+<label>CONTRASEÑA</label><input type="password" name="password" autocomplete="current-password" required>
+<button>Iniciar sesión →</button>{% if error %}<p class="error">{{ error }}</p>{% endif %}</form></main></body></html>
