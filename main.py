@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -9,7 +10,7 @@ import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,27 @@ def init_db() -> None:
               received_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS sms_outbox (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id TEXT NOT NULL UNIQUE,
+              shipment_id INTEGER NOT NULL,
+              phone TEXT NOT NULL DEFAULT '',
+              consent INTEGER NOT NULL DEFAULT 0,
+              tracking_number TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'failed')),
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT NOT NULL DEFAULT '',
+              retryable INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT,
+              lease_until TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              sent_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sms_outbox_due
+            ON sms_outbox(status, retryable, next_attempt_at, lease_until);
+
             CREATE TABLE IF NOT EXISTS admin_audit (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               action TEXT NOT NULL,
@@ -171,8 +193,20 @@ def init_db() -> None:
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     init_db()
+    app.state.sms_outbox_task = asyncio.create_task(sms_outbox_worker())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    task = getattr(app.state, "sms_outbox_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def send_tracking_sms(phone: str, consent: bool, tracking_number: str, status: str, description: str = "") -> bool:
@@ -208,11 +242,7 @@ def send_tracking_sms(phone: str, consent: bool, tracking_number: str, status: s
     try:
         response = httpx.post(
             endpoint,
-            data={
-                "From": TWILIO_FROM_NUMBER,
-                "To": phone,
-                "Body": body[:1500],
-            },
+            data={"From": TWILIO_FROM_NUMBER, "To": phone, "Body": body[:1500]},
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=15.0,
         )
@@ -236,6 +266,119 @@ def send_tracking_sms(phone: str, consent: bool, tracking_number: str, status: s
             tracking_number, type(exc).__name__
         )
         return False
+
+
+def _outbox_error_for_ineligible(phone: str, consent: bool) -> str:
+    if not consent:
+        return "customer_consent_missing"
+    if not phone:
+        return "customer_phone_missing"
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        return "invalid_E164_phone"
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        return "twilio_not_configured"
+    return ""
+
+
+def enqueue_tracking_sms(conn, event_id: str, shipment_id: int, phone: str, consent: bool,
+                         tracking_number: str) -> int:
+    stamp = now_iso()
+    error = _outbox_error_for_ineligible(phone, consent)
+    conn.execute(
+        """INSERT OR IGNORE INTO sms_outbox
+           (event_id, shipment_id, phone, consent, tracking_number, status,
+            attempts, last_error, retryable, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+        (event_id, shipment_id, phone, int(consent), tracking_number,
+         "failed" if error else "pending", error, 0 if error else 1, stamp, stamp),
+    )
+    row = conn.execute("SELECT id FROM sms_outbox WHERE event_id=?", (event_id,)).fetchone()
+    return int(row["id"])
+
+
+def deliver_sms_outbox(outbox_id: int) -> dict[str, Any]:
+    """Claim and deliver one SMS. The lease prevents concurrent app instances from sending it twice."""
+    stamp = now_iso()
+    lease = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat(timespec="seconds")
+    with db() as conn:
+        row = conn.execute("SELECT * FROM sms_outbox WHERE id=?", (outbox_id,)).fetchone()
+        if not row:
+            return {"sent": False, "attempted": False, "reason": "outbox_not_found"}
+        eligible = _outbox_error_for_ineligible(row["phone"], bool(row["consent"]))
+        if eligible:
+            conn.execute(
+                """UPDATE sms_outbox SET status='failed', retryable=0, last_error=?,
+                   lease_until=NULL, updated_at=? WHERE id=? AND status!='sent'""",
+                (eligible, stamp, outbox_id),
+            )
+            return {"sent": False, "attempted": False, "reason": eligible}
+        if row["status"] == "sent":
+            return {"sent": True, "attempted": False, "reason": "sent"}
+        due = row["status"] == "pending" or (
+            row["status"] == "failed" and bool(row["retryable"])
+            and (not row["next_attempt_at"] or row["next_attempt_at"] <= stamp)
+        )
+        lease_active = row["lease_until"] and row["lease_until"] > stamp
+        if not due or lease_active:
+            return {"sent": False, "attempted": False, "reason": "retry_scheduled" if row["retryable"] else row["last_error"]}
+        changed = conn.execute(
+            """UPDATE sms_outbox SET lease_until=?, attempts=attempts+1, updated_at=?
+               WHERE id=? AND status!='sent'
+                 AND (lease_until IS NULL OR lease_until<=?)""",
+            (lease, stamp, outbox_id, stamp),
+        ).rowcount
+        if not changed:
+            return {"sent": False, "attempted": False, "reason": "delivery_in_progress"}
+        row = conn.execute("SELECT * FROM sms_outbox WHERE id=?", (outbox_id,)).fetchone()
+
+    sms_sent = send_tracking_sms(
+        row["phone"], bool(row["consent"]), row["tracking_number"],
+        "Despachado", "Tu pedido fue enviado y ya está disponible para seguimiento."
+    )
+    completed = now_iso()
+    with db() as conn:
+        if sms_sent:
+            conn.execute(
+                """UPDATE sms_outbox SET status='sent', retryable=0, last_error='',
+                   next_attempt_at=NULL, lease_until=NULL, sent_at=?, updated_at=?
+                   WHERE id=? AND status!='sent'""",
+                (completed, completed, outbox_id),
+            )
+            return {"sent": True, "attempted": True, "reason": "sent"}
+        # Transient Twilio failures are retried with capped exponential backoff.
+        delay = min(60 * (2 ** min(max(row["attempts"] - 1, 0), 8)), 21600)
+        next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        conn.execute(
+            """UPDATE sms_outbox SET status='failed', retryable=1,
+               last_error='twilio_request_failed', next_attempt_at=?,
+               lease_until=NULL, updated_at=? WHERE id=? AND status!='sent'""",
+            (next_attempt, completed, outbox_id),
+        )
+    return {"sent": False, "attempted": True, "reason": "twilio_request_failed"}
+
+
+async def sms_outbox_worker():
+    """Poll the persistent SQLite outbox from the existing Railway web process."""
+    while True:
+        try:
+            stamp = now_iso()
+            with db() as conn:
+                rows = conn.execute(
+                    """SELECT id FROM sms_outbox
+                       WHERE (status='pending' OR (status='failed' AND retryable=1
+                              AND (next_attempt_at IS NULL OR next_attempt_at<=?)))
+                         AND (lease_until IS NULL OR lease_until<=?)
+                       ORDER BY id LIMIT 50""",
+                    (stamp, stamp),
+                ).fetchall()
+            for row in rows:
+                await asyncio.to_thread(deliver_sms_outbox, int(row["id"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            import logging
+            logging.getLogger("tracking.sms").exception("SMS outbox polling failed")
+        await asyncio.sleep(30)
 
 
 def password_matches(password: str, encoded: str) -> bool:
@@ -378,7 +521,7 @@ def create_from_webhook(payload: dict[str, Any]):
         if not isinstance(payload.get(key), str) or not payload[key].strip():
             raise HTTPException(status_code=422, detail="Datos de integración no válidos")
 
-    # ProEshop crea la guía cuando el pedido pasa a "Enviado".
+    # ProEshop creates the guide when the order reaches "Enviado".
     if payload["status"].strip().casefold() != "enviado":
         return {"result": "ignored_status"}
 
@@ -386,10 +529,8 @@ def create_from_webhook(payload: dict[str, Any]):
     order_ref = payload["order_ref"].strip()[:80]
     phone = str(payload.get("customer_phone") or "").strip()[:24]
     consent = bool(payload.get("sms_consent"))
-    sms_phone = ""
-    sms_consent = False
-    tracking = ""
-    should_send_sms = False
+    sms_outbox_id = None
+    duplicate = False
     result = "created"
 
     with db() as conn:
@@ -397,111 +538,110 @@ def create_from_webhook(payload: dict[str, Any]):
             "SELECT 1 FROM webhook_events WHERE event_id=?", (event_id,)
         ).fetchone()
         if previous:
+            duplicate = True
             existing = conn.execute(
                 "SELECT tracking_number FROM shipments WHERE order_ref=?", (order_ref,)
             ).fetchone()
-            return {
-                "result": "duplicate_ignored",
-                "tracking_number": existing["tracking_number"] if existing else None,
-            }
+            tracking = existing["tracking_number"] if existing else ""
+            queued = conn.execute(
+                "SELECT id FROM sms_outbox WHERE event_id=?", (event_id,)
+            ).fetchone()
+            sms_outbox_id = int(queued["id"]) if queued else None
+            result = "duplicate_ignored"
+        else:
+            shipment = conn.execute(
+                "SELECT * FROM shipments WHERE order_ref=?", (order_ref,)
+            ).fetchone()
+            stamp = now_iso()
+            should_send_sms = False
 
-        shipment = conn.execute(
-            "SELECT * FROM shipments WHERE order_ref=?", (order_ref,)
-        ).fetchone()
-        stamp = now_iso()
-
-        if shipment:
-            tracking = shipment["tracking_number"]
-            old_status = str(shipment["status"] or "")
-            # Update phone/consent if ProEshop supplies them; preserve existing values otherwise.
-            if phone:
-                conn.execute(
-                    """UPDATE shipments SET status=?, customer_phone=?,
-                       sms_consent=?, updated_at=? WHERE id=?""",
-                    ("Despachado", phone, int(consent), stamp, shipment["id"]),
-                )
+            if shipment:
+                tracking = shipment["tracking_number"]
+                old_status = str(shipment["status"] or "")
+                if phone:
+                    conn.execute(
+                        """UPDATE shipments SET status=?, customer_phone=?,
+                           sms_consent=?, updated_at=? WHERE id=?""",
+                        ("Despachado", phone, int(consent), stamp, shipment["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE shipments SET status=?, updated_at=? WHERE id=?",
+                        ("Despachado", stamp, shipment["id"]),
+                    )
+                if old_status.casefold() != "despachado":
+                    add_event(
+                        conn, shipment["id"], "Despachado",
+                        "Pedido enviado desde ProEshop", source="proeshop"
+                    )
+                    should_send_sms = True
+                result = "updated"
+                current = conn.execute(
+                    "SELECT id, customer_phone, sms_consent FROM shipments WHERE id=?",
+                    (shipment["id"],),
+                ).fetchone()
+                shipment_id = int(current["id"])
+                sms_phone = current["customer_phone"] or ""
+                sms_consent = bool(current["sms_consent"])
             else:
+                tracking = new_tracking_number(conn)
                 conn.execute(
-                    "UPDATE shipments SET status=?, updated_at=? WHERE id=?",
-                    ("Despachado", stamp, shipment["id"]),
+                    """INSERT INTO shipments (
+                        order_ref, tracking_number, carrier, origin_city, origin_country,
+                        destination_city, destination_country, package_description,
+                        estimated_delivery, status, customer_phone, sms_consent, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        order_ref, tracking, "ProEshop Logistics",
+                        str(payload.get("origin_city") or "")[:80] or None,
+                        str(payload.get("origin_country") or "")[:80] or None,
+                        str(payload.get("destination_city") or "")[:80] or None,
+                        str(payload.get("destination_country") or "")[:80] or None,
+                        str(payload.get("package_description") or "")[:160] or None,
+                        str(payload.get("estimated_delivery") or "")[:30] or None,
+                        "Despachado", phone, int(consent), stamp, stamp,
+                    ),
                 )
-            if old_status.casefold() != "despachado":
+                shipment_id = int(conn.execute(
+                    "SELECT id FROM shipments WHERE order_ref=?", (order_ref,)
+                ).fetchone()["id"])
                 add_event(
-                    conn, shipment["id"], "Despachado",
+                    conn, shipment_id, "Despachado",
                     "Pedido enviado desde ProEshop", source="proeshop"
                 )
+                sms_phone = phone
+                sms_consent = consent
                 should_send_sms = True
-            result = "updated"
-            current = conn.execute(
-                "SELECT customer_phone, sms_consent FROM shipments WHERE id=?",
-                (shipment["id"],),
-            ).fetchone()
-            sms_phone = current["customer_phone"] or ""
-            sms_consent = bool(current["sms_consent"])
-        else:
-            tracking = new_tracking_number(conn)
+
             conn.execute(
-                """
-                INSERT INTO shipments (
-                    order_ref, tracking_number, carrier,
-                    origin_city, origin_country,
-                    destination_city, destination_country,
-                    package_description, estimated_delivery,
-                    status, customer_phone, sms_consent, created_at, updated_at
+                "INSERT INTO webhook_events(event_id, order_ref, received_at) VALUES (?, ?, ?)",
+                (event_id, order_ref, stamp),
+            )
+            conn.execute(
+                "INSERT INTO admin_audit(action, subject, created_at) VALUES (?, ?, ?)",
+                ("proeshop_webhook", order_ref, stamp),
+            )
+            if should_send_sms:
+                sms_outbox_id = enqueue_tracking_sms(
+                    conn, event_id, shipment_id, sms_phone, sms_consent, tracking
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_ref, tracking, "ProEshop Logistics",
-                    str(payload.get("origin_city") or "")[:80] or None,
-                    str(payload.get("origin_country") or "")[:80] or None,
-                    str(payload.get("destination_city") or "")[:80] or None,
-                    str(payload.get("destination_country") or "")[:80] or None,
-                    str(payload.get("package_description") or "")[:160] or None,
-                    str(payload.get("estimated_delivery") or "")[:30] or None,
-                    "Despachado", phone, int(consent), stamp, stamp,
-                ),
-            )
-            shipment_id = conn.execute(
-                "SELECT id FROM shipments WHERE order_ref=?", (order_ref,)
-            ).fetchone()["id"]
-            add_event(
-                conn, shipment_id, "Despachado",
-                "Pedido enviado desde ProEshop", source="proeshop"
-            )
-            sms_phone = phone
-            sms_consent = consent
-            should_send_sms = True
 
-        conn.execute(
-            "INSERT INTO webhook_events(event_id, order_ref, received_at) VALUES (?, ?, ?)",
-            (event_id, order_ref, stamp),
-        )
-        conn.execute(
-            "INSERT INTO admin_audit(action, subject, created_at) VALUES (?, ?, ?)",
-            ("proeshop_webhook", order_ref, stamp),
-        )
+    if sms_outbox_id is not None:
+        delivery = deliver_sms_outbox(sms_outbox_id)
+        sms_sent = bool(delivery.get("sent"))
+        sms_reason = delivery.get("reason", "unknown")
+    else:
+        sms_sent = False
+        sms_reason = "already_in_despachado_status" if not duplicate else "no_sms_outbox"
 
-    # Send only after the DB transaction commits. The event_id table prevents webhook retries.
-    sms_sent = False
-    sms_attempted = bool(should_send_sms and sms_consent and sms_phone)
-    if should_send_sms and sms_consent and sms_phone:
-        sms_sent = send_tracking_sms(
-            sms_phone, sms_consent, tracking, "Despachado",
-            "Tu pedido fue enviado y ya está disponible para seguimiento."
-        )
-
+    if duplicate and sms_outbox_id is not None and sms_reason == "sent":
+        sms_reason = "already_sent"
     return {
         "result": result,
         "tracking_number": tracking,
-        "sms_attempted": sms_attempted,
+        "sms_attempted": bool(delivery.get("attempted")) if sms_outbox_id is not None else False,
         "sms_sent": sms_sent,
-        "sms_reason": (
-            "sent" if sms_sent else
-            "twilio_or_phone_error" if sms_attempted else
-            "no_consent_or_phone" if should_send_sms else
-            "already_in_despachado_status"
-        ),
+        "sms_reason": sms_reason,
     }
 
 
