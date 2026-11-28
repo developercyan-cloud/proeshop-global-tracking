@@ -328,53 +328,71 @@ def require_csrf(request: Request, token: str) -> None:
 
 def create_from_webhook(payload: dict[str, Any]):
     for key in ("event_id", "order_ref", "status"):
-        if (
-            not isinstance(payload.get(key), str)
-            or not payload[key].strip()
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="Datos de integración no válidos",
-            )
+        if not isinstance(payload.get(key), str) or not payload[key].strip():
+            raise HTTPException(status_code=422, detail="Datos de integración no válidos")
 
-    # Solo crear guía cuando ProEshop envía el estado exacto "Enviado".
+    # ProEshop crea la guía cuando el pedido pasa a "Enviado".
     if payload["status"].strip().casefold() != "enviado":
         return {"result": "ignored_status"}
 
     event_id = payload["event_id"].strip()[:120]
     order_ref = payload["order_ref"].strip()[:80]
+    phone = str(payload.get("customer_phone") or "").strip()[:24]
+    consent = bool(payload.get("sms_consent"))
+    sms_phone = ""
+    sms_consent = False
+    tracking = ""
+    should_send_sms = False
+    result = "created"
 
     with db() as conn:
         previous = conn.execute(
-            "SELECT 1 FROM webhook_events WHERE event_id=?",
-            (event_id,),
+            "SELECT 1 FROM webhook_events WHERE event_id=?", (event_id,)
         ).fetchone()
-
         if previous:
             existing = conn.execute(
-                "SELECT tracking_number FROM shipments WHERE order_ref=?",
-                (order_ref,),
+                "SELECT tracking_number FROM shipments WHERE order_ref=?", (order_ref,)
             ).fetchone()
-
             return {
                 "result": "duplicate_ignored",
-                "tracking_number": (
-                    existing["tracking_number"] if existing else None
-                ),
+                "tracking_number": existing["tracking_number"] if existing else None,
             }
 
         shipment = conn.execute(
-            "SELECT * FROM shipments WHERE order_ref=?",
-            (order_ref,),
+            "SELECT * FROM shipments WHERE order_ref=?", (order_ref,)
         ).fetchone()
+        stamp = now_iso()
 
         if shipment:
             tracking = shipment["tracking_number"]
-            result = "already_exists"
+            old_status = str(shipment["status"] or "")
+            # Update phone/consent if ProEshop supplies them; preserve existing values otherwise.
+            if phone:
+                conn.execute(
+                    """UPDATE shipments SET status=?, customer_phone=?,
+                       sms_consent=?, updated_at=? WHERE id=?""",
+                    ("Despachado", phone, int(consent), stamp, shipment["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE shipments SET status=?, updated_at=? WHERE id=?",
+                    ("Despachado", stamp, shipment["id"]),
+                )
+            if old_status.casefold() != "despachado":
+                add_event(
+                    conn, shipment["id"], "Despachado",
+                    "Pedido enviado desde ProEshop", source="proeshop"
+                )
+                should_send_sms = True
+            result = "updated"
+            current = conn.execute(
+                "SELECT customer_phone, sms_consent FROM shipments WHERE id=?",
+                (shipment["id"],),
+            ).fetchone()
+            sms_phone = current["customer_phone"] or ""
+            sms_consent = bool(current["sms_consent"])
         else:
             tracking = new_tracking_number(conn)
-            stamp = now_iso()
-
             conn.execute(
                 """
                 INSERT INTO shipments (
@@ -387,57 +405,57 @@ def create_from_webhook(payload: dict[str, Any]):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    order_ref,
-                    tracking,
-                    "ProEshop Logistics",
+                    order_ref, tracking, "ProEshop Logistics",
                     str(payload.get("origin_city") or "")[:80] or None,
                     str(payload.get("origin_country") or "")[:80] or None,
                     str(payload.get("destination_city") or "")[:80] or None,
                     str(payload.get("destination_country") or "")[:80] or None,
                     str(payload.get("package_description") or "")[:160] or None,
                     str(payload.get("estimated_delivery") or "")[:30] or None,
-                    "En preparación",
-                    str(payload.get("customer_phone") or "")[:24],
-                    int(bool(payload.get("sms_consent"))),
-                    stamp,
-                    stamp,
+                    "Despachado", phone, int(consent), stamp, stamp,
                 ),
             )
-
             shipment_id = conn.execute(
-                "SELECT id FROM shipments WHERE order_ref=?",
-                (order_ref,),
+                "SELECT id FROM shipments WHERE order_ref=?", (order_ref,)
             ).fetchone()["id"]
-
             add_event(
-                conn,
-                shipment_id,
-                "En preparación",
-                "Envío creado tras recibirse el evento de pedido Enviado desde ProEshop",
-                source="system",
+                conn, shipment_id, "Despachado",
+                "Pedido enviado desde ProEshop", source="proeshop"
             )
-            result = "created"
+            sms_phone = phone
+            sms_consent = consent
+            should_send_sms = True
 
         conn.execute(
-            """
-            INSERT INTO webhook_events(event_id, order_ref, received_at)
-            VALUES (?, ?, ?)
-            """,
-            (event_id, order_ref, now_iso()),
+            "INSERT INTO webhook_events(event_id, order_ref, received_at) VALUES (?, ?, ?)",
+            (event_id, order_ref, stamp),
         )
-
         conn.execute(
-            """
-            INSERT INTO admin_audit(action, subject, created_at)
-            VALUES (?, ?, ?)
-            """,
-            ("proeshop_webhook", order_ref, now_iso()),
+            "INSERT INTO admin_audit(action, subject, created_at) VALUES (?, ?, ?)",
+            ("proeshop_webhook", order_ref, stamp),
         )
 
-        return {
-            "result": result,
-            "tracking_number": tracking,
-        }
+    # Send only after the DB transaction commits. The event_id table prevents webhook retries.
+    sms_sent = False
+    sms_attempted = bool(should_send_sms and sms_consent and sms_phone)
+    if should_send_sms and sms_consent and sms_phone:
+        sms_sent = send_tracking_sms(
+            sms_phone, sms_consent, tracking, "Despachado",
+            "Tu pedido fue enviado y ya está disponible para seguimiento."
+        )
+
+    return {
+        "result": result,
+        "tracking_number": tracking,
+        "sms_attempted": sms_attempted,
+        "sms_sent": sms_sent,
+        "sms_reason": (
+            "sent" if sms_sent else
+            "twilio_or_phone_error" if sms_attempted else
+            "no_consent_or_phone" if should_send_sms else
+            "already_in_despachado_status"
+        ),
+    }
 
 
 @app.get("/health")
