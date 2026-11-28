@@ -176,18 +176,65 @@ def startup() -> None:
 
 
 def send_tracking_sms(phone: str, consent: bool, tracking_number: str, status: str, description: str = "") -> bool:
-    if not consent or not phone or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+    """Send one transactional tracking SMS through Twilio's REST API."""
+    import logging
+
+    logger = logging.getLogger("tracking.sms")
+    if not consent:
+        logger.info("SMS skipped: customer_consent_missing tracking=%s", tracking_number)
+        return False
+    if not phone:
+        logger.warning("SMS skipped: customer_phone_missing tracking=%s", tracking_number)
+        return False
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        logger.error("SMS not configured: Twilio environment variables missing")
         return False
     if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        logger.warning("SMS skipped: invalid_E164_phone tracking=%s", tracking_number)
         return False
-    url = f"{TRACKING_PUBLIC_URL}/?q={tracking_number}" if TRACKING_PUBLIC_URL else tracking_number
-    body = f"ProEshop Logistics: {tracking_number} · {status}. {description[:180]} Seguimiento: {url}"
+
+    tracking_url = (
+        f"{TRACKING_PUBLIC_URL}/?q={tracking_number}"
+        if TRACKING_PUBLIC_URL else tracking_number
+    )
+    body = (
+        f"ProEshop Logistics: {tracking_number} - {status}. "
+        f"{description[:180]} Seguimiento: {tracking_url}"
+    )
+    endpoint = (
+        f"https://api.twilio.com/2010-04-01/Accounts/"
+        f"{TWILIO_ACCOUNT_SID}/Messages.json"
+    )
     try:
-        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(body=body[:1500], from_=TWILIO_FROM_NUMBER, to=phone)
-        return True
-    except Exception as exc:
-        import logging
-        logging.getLogger("tracking.sms").warning("Twilio SMS failed (%s)", type(exc).__name__)
+        response = httpx.post(
+            endpoint,
+            data={
+                "From": TWILIO_FROM_NUMBER,
+                "To": phone,
+                "Body": body[:1500],
+            },
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=15.0,
+        )
+        if response.status_code == 201:
+            logger.info("SMS accepted by Twilio tracking=%s", tracking_number)
+            return True
+
+        error_code = None
+        try:
+            error_code = response.json().get("code")
+        except (ValueError, AttributeError):
+            pass
+        logger.error(
+            "Twilio rejected SMS tracking=%s http_status=%s error_code=%s",
+            tracking_number, response.status_code, error_code
+        )
+        return False
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Twilio request failed tracking=%s error_type=%s",
+            tracking_number, type(exc).__name__
+        )
         return False
 
 
