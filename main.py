@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import re
+from twilio.rest import Client as TwilioClient
 
 from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,6 +31,10 @@ ADMIN_PASSWORD_HASH = os.getenv("TRACKING_ADMIN_PASSWORD_HASH", "")
 SYNC_SECRET = os.getenv("TRACKING_SYNC_SECRET", "")
 PROESHOP_API_URL = os.getenv("PROESHOP_API_URL", "").strip().rstrip("/")
 MAX_WEBHOOK_AGE = 300
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
+TRACKING_PUBLIC_URL = os.getenv("TRACKING_PUBLIC_URL", "").strip().rstrip("/")
 
 STATUSES = [
     "En preparación",
@@ -123,6 +129,8 @@ def init_db() -> None:
               package_description TEXT,
               estimated_delivery TEXT,
               status TEXT NOT NULL,
+              customer_phone TEXT NOT NULL DEFAULT '',
+              sms_consent INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -156,11 +164,31 @@ def init_db() -> None:
             );
             """
         )
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+        for name, declaration in (("customer_phone", "TEXT NOT NULL DEFAULT ''"), ("sms_consent", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {declaration}")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+
+
+def send_tracking_sms(phone: str, consent: bool, tracking_number: str, status: str, description: str = "") -> bool:
+    if not consent or not phone or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+        return False
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        return False
+    url = f"{TRACKING_PUBLIC_URL}/?q={tracking_number}" if TRACKING_PUBLIC_URL else tracking_number
+    body = f"ProEshop Logistics: {tracking_number} · {status}. {description[:180]} Seguimiento: {url}"
+    try:
+        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(body=body[:1500], from_=TWILIO_FROM_NUMBER, to=phone)
+        return True
+    except Exception as exc:
+        import logging
+        logging.getLogger("tracking.sms").warning("Twilio SMS failed (%s)", type(exc).__name__)
+        return False
 
 
 def password_matches(password: str, encoded: str) -> bool:
@@ -354,9 +382,9 @@ def create_from_webhook(payload: dict[str, Any]):
                     origin_city, origin_country,
                     destination_city, destination_country,
                     package_description, estimated_delivery,
-                    status, created_at, updated_at
+                    status, customer_phone, sms_consent, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_ref,
@@ -369,6 +397,8 @@ def create_from_webhook(payload: dict[str, Any]):
                     str(payload.get("package_description") or "")[:160] or None,
                     str(payload.get("estimated_delivery") or "")[:30] or None,
                     "En preparación",
+                    str(payload.get("customer_phone") or "")[:24],
+                    int(bool(payload.get("sms_consent"))),
                     stamp,
                     stamp,
                 ),
@@ -661,7 +691,10 @@ async def add_admin_event(
         conn.execute("INSERT INTO admin_audit(action, subject, created_at) VALUES (?, ?, ?)",
                      ("admin_event", str(shipment_id), now_iso()))
         order_ref = shipment["order_ref"]
-    # The local update is committed before the callback; ProEshop handles customer email.
+        sms_phone = shipment["customer_phone"] if "customer_phone" in shipment.keys() else ""
+        sms_consent = bool(shipment["sms_consent"]) if "sms_consent" in shipment.keys() else False
+        tracking_number = shipment["tracking_number"]
+    send_tracking_sms(sms_phone, sms_consent, tracking_number, status, description.strip())
     await notify_proeshop_logistics(order_ref, status, description.strip(), city, country)
     return RedirectResponse("/admin", status_code=303)
 
